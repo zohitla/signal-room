@@ -725,7 +725,7 @@ def run_alerts(state):
                 if not cid:
                     continue
                 now_ids.append(cid)
-                if a["trending"] and cid not in a["trending"]:
+                if a.get("trending_ready") and cid not in a["trending"]:
                     ch = ((it.get("data") or {}).get("price_change_percentage_24h") or {}).get("usd")
                     lines = [f"#{rank} on coingecko"]
                     if ch is not None:
@@ -734,7 +734,8 @@ def run_alerts(state):
                     sent += ok
                     if not ok and cooled(state, f"trend:{cid}"):
                         now_ids.remove(cid)  # delivery failed: leave it "new" so next run retries
-            a["trending"] = now_ids  # first run just learns the list
+            a["trending"] = now_ids
+            a["trending_ready"] = True  # first run just learns the list
 
     # 🩳💥📈 futures / shorts
     if SHORTS_ALERTS:
@@ -753,6 +754,13 @@ def run_alerts(state):
 
 def main():
     state = load_state()
+    try:
+        run(state)
+    finally:
+        save_state(state)  # even if something crashes, remember what was already posted
+
+
+def run(state):
     seen = set(state["seen"])
     new_items = []
 
@@ -819,7 +827,18 @@ def main():
     for q in expired:
         print("Expired from queue (too old now):", q["title"])
         done(q["key"])
-    queue[:] = [q for q in queue if q.get("queued_at", 0) >= cutoff][-QUEUE_MAX_ITEMS:]
+    queue[:] = [q for q in queue if q.get("queued_at", 0) >= cutoff]
+    if len(queue) > QUEUE_MAX_ITEMS:
+        # over the cap: keep 🚨/MAJOR stories and the newest ones, drop the rest (and say so)
+        queue.sort(key=lambda x: (x.get("score", 0) >= MAJOR_SCORE, x["hot"], x.get("queued_at", 0)), reverse=True)
+        dropped = queue[QUEUE_MAX_ITEMS:]
+        del queue[QUEUE_MAX_ITEMS:]
+        for q in dropped:
+            done(q["key"])
+        print(f"Queue full: dropped {len(dropped)} lowest-priority stories, e.g. {dropped[0]['title']}")
+        mark("news queue", False, f"backed up, dropped {len(dropped)} low-priority stories")
+    else:
+        mark("news queue", True)
 
     # Watchlist stuff first, then oldest first
     queue.sort(key=lambda x: (not x["hot"], x.get("queued_at", 0)))
