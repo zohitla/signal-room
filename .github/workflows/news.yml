@@ -2,12 +2,13 @@ name: news-wire
 
 on:
   schedule:
-    - cron: "*/5 * * * *"    # every 5 minutes (GitHub can delay a few min)
-  workflow_dispatch:          # lets you hit "Run workflow" manually
+    - cron: "*/5 * * * *"    # backup timer (GitHub often runs this late)
+  workflow_dispatch:          # cron-job.org presses this every 5 min
 
 permissions:
   contents: write
 
+# only one run at a time, so two runs never fight over state.json
 concurrency:
   group: news-wire
   cancel-in-progress: false
@@ -39,9 +40,23 @@ jobs:
           TG_SESSION: ${{ secrets.TG_SESSION }}
         run: python copier.py
       - name: Save memory of what was posted
+        if: always()   # save even if the bot step crashed, so nothing gets re-posted
         run: |
           git config user.name "news-bot"
           git config user.email "news-bot@users.noreply.github.com"
-          git add state.json copier_state.json 2>/dev/null || git add state.json
-          git diff --cached --quiet || git commit -m "update state [skip ci]"
-          git push || true
+          git add state.json 2>/dev/null || true
+          git add copier_state.json 2>/dev/null || true
+          if git diff --cached --quiet; then
+            echo "Nothing to save"; exit 0
+          fi
+          git commit -m "update state [skip ci]"
+          # if you edited a file on GitHub while this ran, merge that in and try again
+          for i in 1 2 3; do
+            if git pull --rebase -X theirs origin main && git push; then
+              echo "Memory saved"; exit 0
+            fi
+            echo "Save attempt $i failed, retrying..."
+            sleep 5
+          done
+          echo "::error::Could not save state.json after 3 tries, the next run may re-post stories"
+          exit 1
