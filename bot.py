@@ -39,7 +39,8 @@ WATCHLIST = [
     "bitcoin", "btc", "ethereum", "etf", "sec", "stablecoin", "hack", "exploit",
     "oil", "crude", "brent", "opec", "hormuz", "iran",
     "meta", "muse", "openai", "anthropic", "nvidia", "google", "apple", "tesla",
-    "fed", "rate cut", "rate hike", "tariff", "trump", "breaking",
+    "fed", "powell", "rate cut", "rate hike", "tariff", "trump", "breaking",
+    "elon", "musk", "saylor", "cz", "solana", "xrp", "just in",
 ]
 
 
