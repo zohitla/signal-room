@@ -6,7 +6,7 @@ and posts new headlines to your Telegram channel in wire style:
     🇮🇷 *TRUMP REJECTS IRANIAN PLAN TO REOPEN STRAIT OF HORMUZ
     — Reuters
 
-Runs once per call (GitHub Actions calls it every 10 min).
+Runs once per call (GitHub Actions calls it on a schedule).
 """
 
 import json
@@ -38,6 +38,16 @@ LOUD_ONLY_FOR_WATCHLIST = True
 AI_SIMPLE_HEADLINES = True   # rewrite every headline short + simple
 AI_TAKES = "hot"             # "hot" = 🧠 take under 🚨 stories only, "all" = every story, "off" = none
 AI_MODEL = "claude-haiku-4-5-20251001"
+AI_FILTER = True             # AI skips junk (sports, local stories, fund promos...) before posting
+MAX_AI_CALLS_PER_RUN = 40    # cost safety cap
+
+# Always skipped, even without AI (lowercase words/phrases)
+BLOCKLIST = [
+    "nfl", "nba", "mlb", "nhl", "playoffs", "standings", "touchdown", "super bowl",
+    "world series", "premier league", "fantasy football", "box score", "horoscope",
+    "recipe", "celebrity", "red carpet", "best deals", "coupon", "how to watch",
+    "municipal", "fund q", "fund update", "quarterly update",
+]
 
 # Stuff you REALLY don't want to miss. Headlines with these get a 🚨 and go first.
 WATCHLIST = [
@@ -163,14 +173,30 @@ def on_watchlist(title):
     return any(re.search(r"\b" + re.escape(k) + r"\b", t) for k in WATCHLIST)
 
 
+def blocked(title):
+    t = title.lower()
+    return any(re.search(r"\b" + re.escape(k) + r"\b", t) for k in BLOCKLIST)
+
+
+def clean_source(src):
+    """'Al Jazeera – Breaking News, World News and Video from Al Jazeera' -> 'Al Jazeera'"""
+    src = re.split(r"\s[-–—|:]\s|\s\|", src or "")[0].strip()
+    return src[:40] or "News"
+
+
 AI_PROMPT = """You write for a fast Telegram news feed read by crypto/stock traders.
 
 Headline: {title}
 Source: {source}
 
 Reply with ONLY a JSON object, no other text:
-{{"headline": "...", "take": "..."}}
+{{"keep": true, "headline": "...", "take": "..."}}
 
+keep: true ONLY if a trader or someone following world news would care: markets, stocks,
+crypto, oil/commodities, central banks, economy data, big tech/AI, wars, geopolitics,
+elections, sanctions/tariffs, or disasters with global impact. false for sports, local or
+regional stories with no market impact, lifestyle, celebrity, fund/product promos,
+routine company reports nobody trades on, listicles and how-tos.
 headline: rewrite it in the simplest possible words, max 12 words, keep the key facts
 and numbers, no hype, no invented details.
 take: {take_rule}"""
@@ -181,9 +207,9 @@ TAKE_RULE = ("1-2 short lines on which sectors, stocks (tickers) or coins this c
 
 
 def ai_process(title, source, want_take):
-    """Returns (headline, take). Falls back to the original title if AI is off or fails."""
-    if not ANTHROPIC_KEY or not (AI_SIMPLE_HEADLINES or want_take):
-        return title, ""
+    """Returns (keep, headline, take). Falls back to the original title if AI is off or fails."""
+    if not ANTHROPIC_KEY or not (AI_SIMPLE_HEADLINES or want_take or AI_FILTER):
+        return True, title, ""
     try:
         prompt = AI_PROMPT.format(
             title=title, source=source,
@@ -202,17 +228,18 @@ def ai_process(title, source, want_take):
         )
         if not r.ok:
             print("AI error:", r.status_code, r.text[:200])
-            return title, ""
+            return True, title, ""
         text = r.json()["content"][0]["text"].strip()
         text = re.sub(r"^```(json)?|```$", "", text).strip()
         m = re.search(r"\{.*\}", text, re.S)
         data = json.loads(m.group(0) if m else text)
         headline = (data.get("headline") or "").strip() if AI_SIMPLE_HEADLINES else ""
         take = (data.get("take") or "").strip() if want_take else ""
-        return headline or title, take
+        keep = bool(data.get("keep", True)) if AI_FILTER else True
+        return keep, headline or title, take
     except Exception as e:
         print("AI failed:", e)
-        return title, ""
+        return True, title, ""
 
 
 def send(text, silent=False, reply_to=None):
@@ -293,7 +320,7 @@ def main():
         except Exception as e:
             print("Feed failed:", url, e)
             continue
-        feed_title = feed.feed.get("title", category).split(" - ")[0].split("|")[0].strip()
+        feed_title = clean_source(feed.feed.get("title", category))
         for entry in feed.entries[:25]:
             link = entry.get("link", "")
             raw_title = re.sub(r"\s+", " ", entry.get("title", "")).strip()
@@ -305,6 +332,7 @@ def main():
             if entry_age_hours(entry) > MAX_AGE_HOURS:
                 continue
             title, source = split_source(raw_title, entry, feed_title)
+            source = clean_source(source)
             new_items.append({
                 "title": title, "source": source, "link": link,
                 "emoji": emoji, "category": category, "hot": on_watchlist(title),
@@ -323,14 +351,26 @@ def main():
     # Watchlist stuff first, then everything else
     new_items.sort(key=lambda x: not x["hot"])
 
-    posted = 0
+    posted = skipped = ai_calls = 0
     for it in new_items:
         if posted >= MAX_POSTS_PER_RUN:
             break
         if is_duplicate(it["title"], state["recent_titles"]):
             continue
+        if blocked(it["title"]):
+            skipped += 1
+            continue
         want_take = AI_TAKES == "all" or (AI_TAKES == "hot" and it["hot"])
-        headline, take = ai_process(it["title"], it["source"], want_take)
+        if ai_calls < MAX_AI_CALLS_PER_RUN:
+            ai_calls += 1
+            keep, headline, take = ai_process(it["title"], it["source"], want_take)
+        else:
+            keep, headline, take = True, it["title"], ""
+        if not keep:
+            skipped += 1
+            state["recent_titles"].append(sorted(words(it["title"])))  # remember junk, don't re-check copies
+            print("Skipped (junk):", it["title"])
+            continue
         msg_id = send(format_post(it, headline), silent=not (it["hot"] or not LOUD_ONLY_FOR_WATCHLIST))
         if msg_id:
             state["recent_titles"].append(sorted(words(it["title"])))
@@ -342,7 +382,7 @@ def main():
 
     price_pulse(state)
     save_state(state)
-    print(f"Posted {posted} of {len(new_items)} new items.")
+    print(f"Posted {posted}, skipped {skipped} junk, of {len(new_items)} new items.")
 
 
 if __name__ == "__main__":
