@@ -319,7 +319,7 @@ def format_post(item, lines):
         if rest:
             body += "\n" + "\n".join("&gt;" + esc(l) for l in rest)
         src = esc(item["source"].lower())
-        return f"<pre>{body}</pre><a href=\"{esc(item['link'])}\">{src}</a>"
+        return f"{body}\n<a href=\"{esc(item['link'])}\">{src}</a>"
     headline = " ".join(lines)
     prefix = "🚨 " if item["hot"] else ""
     flag = flag_for(item["title"])
@@ -333,7 +333,7 @@ def format_post(item, lines):
 def format_take(take):
     if STYLE == "greentext":
         lines = [l.strip().lstrip(">").strip() for l in re.split(r"\n|(?<=[.;])\s+", take) if l.strip()]
-        return "<pre>" + "\n".join("&gt;" + esc(l) for l in lines[:3]) + "</pre><i>ai take, nfa</i>"
+        return "\n".join("&gt;" + esc(l) for l in lines[:3]) + "\n<i>ai take, nfa</i>"
     return f"🧠 <b>Why it matters:</b> {esc(take)}\n<i>AI take, not financial advice</i>"
 
 
