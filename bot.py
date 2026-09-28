@@ -51,9 +51,34 @@ BLOCKLIST = [
     "municipal", "fund q", "fund update", "quarterly update",
 ]
 
+# ───────── ALERTS ─────────
+MAJOR_SCORE = 8              # AI importance 1-10. this or higher = 🚨🚨 MAJOR headline (always buzzes)
+
+# 🎯 Price alerts: (coin id on coingecko, "above" or "below", price in USD)
+# find a coin's id in its coingecko URL, e.g. coingecko.com/en/coins/solana -> "solana"
+PRICE_ALERTS = [
+    ("bitcoin", "above", 90000),
+    ("bitcoin", "below", 80000),
+]
+
+ALERTS_ON = True
+MAJORS = ["bitcoin", "ethereum", "solana", "ripple"]
+MAJOR_MOVE_PCT = 3           # ⚡ BTC/ETH/SOL/XRP moving this % in 1 hour
+ALT_MOVE_PCT = 10            # ⚡ any other top-250 coin moving this % in 1 hour
+MIN_VOLUME_USD = 20_000_000  # ignore tiny illiquid coins
+VOLUME_SPIKE_X = 2.0         # 📊 24h volume this many times its normal level
+TRENDING_ALERTS = True       # 🔥 coin enters coingecko trending top 7
+# 🩳💥📈 Shorts / futures alerts (free data from Hyperliquid perps)
+SHORTS_ALERTS = True
+CROWDED_FUNDING = -0.00005   # hourly funding at or below this = shorts crowded (-0.005%/h)
+SQUEEZE_PCT = 4              # 💥 price up this % since last check while shorts are paying
+OI_SPIKE_X = 1.3             # 📈 open interest this many times its normal level
+MIN_OI_USD = 5_000_000       # ignore small markets
+ALERT_COOLDOWN_HOURS = 3     # don't repeat the same alert for the same coin within this
+
 # Stuff you REALLY don't want to miss. Headlines with these get a 🚨 and go first.
 WATCHLIST = [
-    "bitcoin", "btc", "ethereum", "etf", "sec", "stablecoin", "hack", "exploit",
+    "bitcoin", "btc", "ethereum", "etf", "sec", "stablecoin", "hack", "hacked", "exploit", "exploited",
     "oil", "crude", "brent", "opec", "hormuz", "iran",
     "meta", "muse", "openai", "anthropic", "nvidia", "google", "apple", "tesla",
     "fed", "powell", "rate cut", "rate hike", "tariff", "trump", "breaking",
@@ -192,13 +217,17 @@ Headline: {title}
 Source: {source}
 
 Reply with ONLY a JSON object, no other text:
-{{"keep": true, "lines": ["...", "..."], "take": "..."}}
+{{"keep": true, "score": 5, "lines": ["...", "..."], "take": "..."}}
 
 keep: true ONLY if a trader or someone following world news would care: markets, stocks,
 crypto, oil/commodities, central banks, economy data, big tech/AI, wars, geopolitics,
 elections, sanctions/tariffs, or disasters with global impact. false for sports, local or
 regional stories with no market impact, lifestyle, celebrity, fund/product promos,
 routine company reports nobody trades on, listicles and how-tos.
+
+score: 1-10, how big this is for markets/the world right now. 9-10 = everyone will be talking
+about it (war escalation, fed surprise, major hack, huge crash/pump, giant company news).
+7-8 = important. 1-6 = normal news. be strict, most stories are 3-6.
 
 lines: {style_rule}
 
@@ -210,6 +239,8 @@ count them. cut words, use symbols (+, /, -, %, $) and abbreviations to fit.
    move = 1-3 lowercase words
 2) why it matters, lowercase (do NOT start with >, it gets added)
 3) short implication, lowercase (do NOT start with >)
+write it so a 16 year old new investor instantly gets it: simple everyday words, no jargon
+(say "rates going up" not "hawkish repricing"), but keep it accurate.
 style: blunt, no newsroom language, no emojis, slang ok ("cooked", "smoked", "printing", "bros")
 but keep the key number/ticker/country. never invent facts or predict prices.
 example for "Seoul stocks fall 2% as Samsung, SK Hynix slide on rising yields":
@@ -240,9 +271,9 @@ def fallback_lines(title):
 
 
 def ai_process(title, source, want_take):
-    """Returns (keep, lines, take). Falls back to the original title if AI is off or fails."""
+    """Returns (keep, lines, take, score). Falls back to the original title if AI is off or fails."""
     if not ANTHROPIC_KEY or not (AI_SIMPLE_HEADLINES or want_take or AI_FILTER):
-        return True, fallback_lines(title), ""
+        return True, fallback_lines(title), "", 0
     try:
         voice = ("Same lowercase blunt greentext voice." if STYLE == "greentext" else "Plain language.")
         prompt = AI_PROMPT.format(
@@ -263,7 +294,7 @@ def ai_process(title, source, want_take):
         )
         if not r.ok:
             print("AI error:", r.status_code, r.text[:200])
-            return True, fallback_lines(title), ""
+            return True, fallback_lines(title), "", 0
         text = r.json()["content"][0]["text"].strip()
         text = re.sub(r"^```(json)?|```$", "", text).strip()
         m = re.search(r"\{.*\}", text, re.S)
@@ -276,10 +307,14 @@ def ai_process(title, source, want_take):
             lines = fallback_lines(title)
         take = (data.get("take") or "").strip() if want_take else ""
         keep = bool(data.get("keep", True)) if AI_FILTER else True
-        return keep, lines, take
+        try:
+            score = int(data.get("score", 0))
+        except (TypeError, ValueError):
+            score = 0
+        return keep, lines, take, score
     except Exception as e:
         print("AI failed:", e)
-        return True, fallback_lines(title), ""
+        return True, fallback_lines(title), "", 0
 
 
 def send(text, silent=False, reply_to=None):
@@ -314,14 +349,14 @@ def format_post(item, lines):
         if len(lines) > 1:  # AI-written greentext: enforce the limit. plain fallback headline stays whole
             lines = [shorten(l) for l in lines]
         head, rest = lines[0], lines[1:3]
-        alert = "🚨 " if item["hot"] else ""
-        body = alert + esc(head)
+        alert = "🚨🚨 MAJOR: " if item.get("major") else ("🚨 " if item["hot"] else "")
+        body = f"<b>{alert}{esc(head.upper())}</b>"
         if rest:
             body += "\n" + "\n".join("&gt;" + esc(l) for l in rest)
         src = esc(item["source"].lower())
         return f"{body}\n<a href=\"{esc(item['link'])}\">{src}</a>"
     headline = " ".join(lines)
-    prefix = "🚨 " if item["hot"] else ""
+    prefix = "🚨🚨 MAJOR: " if item.get("major") else ("🚨 " if item["hot"] else "")
     flag = flag_for(item["title"])
     icon = f"{flag} " if flag else f"{item['emoji']} "
     return (
@@ -363,6 +398,247 @@ def price_pulse(state):
             state["last_pulse"] = now
     except Exception as e:
         print("Price pulse failed:", e)
+
+
+# ───────────────────────── ALERTS ENGINE ─────────────────────────
+
+CG = "https://api.coingecko.com/api/v3"
+
+
+def cg_get(path, **params):
+    try:
+        r = requests.get(CG + path, params=params, timeout=20,
+                         headers={"User-Agent": "Mozilla/5.0 signalroom"})
+        if r.status_code == 429:
+            print("CoinGecko rate limit, skipping alerts this run")
+            return None
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        print("CoinGecko failed:", e)
+        return None
+
+
+def money(x):
+    if x >= 1e9:
+        return f"${x/1e9:.1f}B"
+    if x >= 1e6:
+        return f"${x/1e6:.0f}M"
+    if x >= 1000:
+        return f"${x:,.0f}"
+    if x >= 1:
+        return f"${x:,.2f}"
+    if x <= 0:
+        return "$0"
+    digits = max(2, -int(f"{x:e}".split("e")[1]) + 3)   # keep 3-4 meaningful digits
+    return f"${x:.{digits}f}".rstrip("0").rstrip(".")
+
+
+def pct(x):
+    return f"{x:+.1f}%"
+
+
+def coin_link(cid, label):
+    return f"<a href=\"https://www.coingecko.com/en/coins/{esc(cid)}\">{esc(label)}</a>"
+
+
+def alert_msg(icon, sym, what, lines, cid):
+    body = f"<b>{icon} {esc(sym.upper())} – {esc(what.upper())}</b>"
+    body += "\n" + "\n".join("&gt;" + esc(l) for l in lines)
+    return body + "\n" + coin_link(cid, "coingecko")
+
+
+def cooled(state, key):
+    last = state["alerts"]["cooldown"].get(key, 0)
+    if time.time() - last < ALERT_COOLDOWN_HOURS * 3600:
+        return False
+    state["alerts"]["cooldown"][key] = time.time()
+    return True
+
+
+def hl_markets():
+    """Hyperliquid perps: returns list of dicts with sym, price, funding, oi_usd, vol_usd."""
+    try:
+        r = requests.post("https://api.hyperliquid.xyz/info", json={"type": "metaAndAssetCtxs"},
+                          timeout=20, headers={"Content-Type": "application/json"})
+        r.raise_for_status()
+        meta, ctxs = r.json()
+        out = []
+        for asset, ctx in zip(meta.get("universe", []), ctxs):
+            try:
+                price = float(ctx.get("markPx") or ctx.get("midPx") or 0)
+                if not price:
+                    continue
+                out.append({
+                    "sym": asset["name"],
+                    "price": price,
+                    "prev_day": float(ctx.get("prevDayPx") or 0),
+                    "funding": float(ctx.get("funding") or 0),
+                    "oi_usd": float(ctx.get("openInterest") or 0) * price,
+                    "vol_usd": float(ctx.get("dayNtlVlm") or 0),
+                })
+            except (TypeError, ValueError, KeyError):
+                continue
+        return out
+    except Exception as e:
+        print("Hyperliquid failed:", e)
+        return None
+
+
+def hl_link(sym):
+    return f"<a href=\"https://app.hyperliquid.xyz/trade/{esc(sym)}\">hyperliquid</a>"
+
+
+def futures_msg(icon, sym, what, lines):
+    body = f"<b>{icon} {esc(sym.upper())} – {esc(what.upper())}</b>"
+    body += "\n" + "\n".join("&gt;" + esc(l) for l in lines)
+    return body + "\n" + hl_link(sym)
+
+
+def run_shorts_alerts(state):
+    a = state["alerts"]
+    a.setdefault("hl_price", {})
+    a.setdefault("oi_avg", {})
+    a.setdefault("oi_n", {})
+    mkts = hl_markets()
+    if not mkts:
+        return 0
+    sent = 0
+    for m in mkts:
+        sym, price, fund, oi = m["sym"], m["price"], m["funding"], m["oi_usd"]
+        if oi < MIN_OI_USD:
+            continue
+        last = a["hl_price"].get(sym)
+        fund_txt = f"funding {fund*100:+.3f}%/h"
+
+        # 💥 short squeeze: price ripping since last check while shorts pay funding
+        if last and fund < 0:
+            move = (price / last - 1) * 100
+            if move >= SQUEEZE_PCT and cooled(state, f"squeeze:{sym}"):
+                send(futures_msg("💥", sym, "short squeeze",
+                                 [f"{pct(move)} since last chk", "shorts paying up", f"oi {money(oi)}"]))
+                sent += 1
+
+        # 🩳 crowded shorts
+        if fund <= CROWDED_FUNDING and cooled(state, f"crowded:{sym}"):
+            day = (price / m["prev_day"] - 1) * 100 if m["prev_day"] else 0
+            send(futures_msg("🩳", sym, "shorts crowded",
+                             [fund_txt, f"oi {money(oi)}", f"24h {pct(day)}"]))
+            sent += 1
+
+        # 📈 open interest spike vs its running average
+        avg, n = a["oi_avg"].get(sym), a["oi_n"].get(sym, 0)
+        if avg and n >= 6 and oi >= OI_SPIKE_X * avg and cooled(state, f"oi:{sym}"):
+            side = "shorts piling in" if fund < 0 else "longs piling in"
+            send(futures_msg("📈", sym, "oi spike",
+                             [f"oi {oi/avg:.1f}x normal", f"now {money(oi)}", side]))
+            sent += 1
+
+        a["hl_price"][sym] = price
+        a["oi_avg"][sym] = oi if not avg else avg * 0.9 + oi * 0.1
+        a["oi_n"][sym] = n + 1
+    return sent
+
+
+def run_alerts(state):
+    if not ALERTS_ON:
+        return 0
+    a = state.setdefault("alerts", {})
+    a.setdefault("cooldown", {})
+    a.setdefault("vol_avg", {})
+    a.setdefault("vol_n", {})
+    a.setdefault("armed", {})
+    a.setdefault("trending", [])
+    sent = 0
+
+    coins = cg_get("/coins/markets", vs_currency="usd", order="market_cap_desc",
+                   per_page=250, page=1, price_change_percentage="1h,24h")
+    if coins:
+        by_id = {c["id"]: c for c in coins}
+
+        # 🎯 price alerts (fire once, re-arm after price moves back 1% the other way)
+        for cid, side, level in PRICE_ALERTS:
+            c = by_id.get(cid) or {}
+            price = c.get("current_price")
+            if price is None:
+                data = cg_get("/simple/price", ids=cid, vs_currencies="usd")
+                price = (data or {}).get(cid, {}).get("usd")
+                if price is None:
+                    continue
+            key = f"{cid}:{side}:{level}"
+            hit = price >= level if side == "above" else price <= level
+            if hit and a["armed"].get(key, True):
+                sym = c.get("symbol", cid)
+                lines = [f"now {money(price)}", f"24h {pct(c.get('price_change_percentage_24h') or 0)}"]
+                send(alert_msg("🎯", sym, f"{side} {money(level)}", lines, cid))
+                a["armed"][key] = False
+                sent += 1
+            elif not hit:
+                back = price < level * 0.99 if side == "above" else price > level * 1.01
+                if back:
+                    a["armed"][key] = True
+
+        for c in coins:
+            cid, sym = c["id"], c.get("symbol", "")
+            vol = c.get("total_volume") or 0
+            ch1 = c.get("price_change_percentage_1h_in_currency")
+            price = c.get("current_price") or 0
+
+            # ⚡ big 1h moves
+            limit = MAJOR_MOVE_PCT if cid in MAJORS else ALT_MOVE_PCT
+            if ch1 is not None and abs(ch1) >= limit and (vol >= MIN_VOLUME_USD or cid in MAJORS):
+                if cooled(state, f"move:{cid}"):
+                    what = "pumping" if ch1 > 0 else "dumping"
+                    send(alert_msg("⚡", sym, what, [f"{pct(ch1)} in 1h", f"now {money(price)}"], cid))
+                    sent += 1
+
+            # 📊 volume spikes vs its own running average
+            avg = a["vol_avg"].get(cid)
+            n = a["vol_n"].get(cid, 0)
+            if avg and n >= 6 and vol >= MIN_VOLUME_USD and vol >= VOLUME_SPIKE_X * avg:
+                if cooled(state, f"vol:{cid}"):
+                    lines = [f"vol {vol/avg:.1f}x normal", f"24h vol {money(vol)}",
+                             f"price {pct(c.get('price_change_percentage_24h') or 0)}"]
+                    send(alert_msg("📊", sym, "volume spike", lines, cid))
+                    sent += 1
+            if vol:
+                a["vol_avg"][cid] = vol if not avg else avg * 0.9 + vol * 0.1
+                a["vol_n"][cid] = n + 1
+
+        # keep state small: only coins still in the top 250
+        for k in ("vol_avg", "vol_n"):
+            a[k] = {cid: v for cid, v in a[k].items() if cid in by_id}
+
+    # 🔥 trending
+    if TRENDING_ALERTS:
+        t = cg_get("/search/trending")
+        if t and t.get("coins"):
+            now_ids = []
+            for rank, item in enumerate(t["coins"][:7], 1):
+                it = item.get("item", {})
+                cid = it.get("id")
+                if not cid:
+                    continue
+                now_ids.append(cid)
+                if a["trending"] and cid not in a["trending"] and cooled(state, f"trend:{cid}"):
+                    ch = ((it.get("data") or {}).get("price_change_percentage_24h") or {}).get("usd")
+                    lines = [f"#{rank} on coingecko"]
+                    if ch is not None:
+                        lines.append(f"24h {pct(ch)}")
+                    send(alert_msg("🔥", it.get("symbol", cid), "trending", lines, cid))
+                    sent += 1
+            a["trending"] = now_ids
+
+    # 🩳💥📈 futures / shorts
+    if SHORTS_ALERTS:
+        sent += run_shorts_alerts(state)
+
+    # clean old cooldowns
+    cutoff = time.time() - 2 * ALERT_COOLDOWN_HOURS * 3600
+    a["cooldown"] = {k: v for k, v in a["cooldown"].items() if v > cutoff}
+    if sent:
+        print(f"Sent {sent} alerts.")
+    return sent
 
 
 # ───────────────────────── MAIN ─────────────────────────
@@ -423,15 +699,17 @@ def main():
         want_take = STYLE != "greentext" and (AI_TAKES == "all" or (AI_TAKES == "hot" and it["hot"]))
         if ai_calls < MAX_AI_CALLS_PER_RUN:
             ai_calls += 1
-            keep, lines, take = ai_process(it["title"], it["source"], want_take)
+            keep, lines, take, score = ai_process(it["title"], it["source"], want_take)
         else:
-            keep, lines, take = True, fallback_lines(it["title"]), ""
+            keep, lines, take, score = True, fallback_lines(it["title"]), "", 0
+        it["major"] = score >= MAJOR_SCORE
         if not keep:
             skipped += 1
             state["recent_titles"].append(sorted(words(it["title"])))  # remember junk, don't re-check copies
             print("Skipped (junk):", it["title"])
             continue
-        msg_id = send(format_post(it, lines), silent=not (it["hot"] or not LOUD_ONLY_FOR_WATCHLIST))
+        loud = it["major"] or it["hot"] or not LOUD_ONLY_FOR_WATCHLIST
+        msg_id = send(format_post(it, lines), silent=not loud)
         if msg_id:
             state["recent_titles"].append(sorted(words(it["title"])))
             posted += 1
@@ -439,6 +717,7 @@ def main():
                 send(format_take(take), silent=True, reply_to=msg_id)
             time.sleep(1.5)
 
+    run_alerts(state)
     price_pulse(state)
     save_state(state)
     print(f"Posted {posted}, skipped {skipped} junk, of {len(new_items)} new items.")
