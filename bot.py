@@ -34,6 +34,11 @@ PRICE_PULSE_EVERY_HOURS = 4 # posts BTC/ETH/SOL prices every X hours (0 = off)
 # arrives silently in the channel. False = every headline buzzes.
 LOUD_ONLY_FOR_WATCHLIST = True
 
+# AI (needs ANTHROPIC_API_KEY secret, otherwise these are ignored)
+AI_SIMPLE_HEADLINES = True   # rewrite every headline short + simple
+AI_TAKES = "hot"             # "hot" = 🧠 take under 🚨 stories only, "all" = every story, "off" = none
+AI_MODEL = "claude-haiku-4-5-20251001"
+
 # Stuff you REALLY don't want to miss. Headlines with these get a 🚨 and go first.
 WATCHLIST = [
     "bitcoin", "btc", "ethereum", "etf", "sec", "stablecoin", "hack", "exploit",
@@ -158,11 +163,32 @@ def on_watchlist(title):
     return any(re.search(r"\b" + re.escape(k) + r"\b", t) for k in WATCHLIST)
 
 
-def ai_rewrite(title):
-    """Optional: have Claude rewrite the headline in terse wire style."""
-    if not ANTHROPIC_KEY:
-        return title
+AI_PROMPT = """You write for a fast Telegram news feed read by crypto/stock traders.
+
+Headline: {title}
+Source: {source}
+
+Reply with ONLY a JSON object, no other text:
+{{"headline": "...", "take": "..."}}
+
+headline: rewrite it in the simplest possible words, max 12 words, keep the key facts
+and numbers, no hype, no invented details.
+take: {take_rule}"""
+
+TAKE_RULE = ("1-2 short lines on which sectors, stocks (tickers) or coins this could move and why. "
+             "Plain language. If it's not market-relevant, return an empty string. "
+             "Never predict prices or tell anyone to buy or sell.")
+
+
+def ai_process(title, source, want_take):
+    """Returns (headline, take). Falls back to the original title if AI is off or fails."""
+    if not ANTHROPIC_KEY or not (AI_SIMPLE_HEADLINES or want_take):
+        return title, ""
     try:
+        prompt = AI_PROMPT.format(
+            title=title, source=source,
+            take_rule=TAKE_RULE if want_take else 'always return an empty string ""',
+        )
         r = requests.post(
             "https://api.anthropic.com/v1/messages",
             headers={
@@ -170,56 +196,57 @@ def ai_rewrite(title):
                 "anthropic-version": "2023-06-01",
                 "content-type": "application/json",
             },
-            json={
-                "model": "claude-haiku-4-5-20251001",
-                "max_tokens": 80,
-                "messages": [{
-                    "role": "user",
-                    "content": "Rewrite this news headline as a terse Bloomberg-terminal wire headline. "
-                               "Keep every fact, add nothing, max 15 words, no quotes, reply with only the headline:\n\n"
-                               + title,
-                }],
-            },
-            timeout=20,
+            json={"model": AI_MODEL, "max_tokens": 250,
+                  "messages": [{"role": "user", "content": prompt}]},
+            timeout=30,
         )
+        if not r.ok:
+            print("AI error:", r.status_code, r.text[:200])
+            return title, ""
         text = r.json()["content"][0]["text"].strip()
-        return text or title
-    except Exception:
-        return title
+        text = re.sub(r"^```(json)?|```$", "", text).strip()
+        m = re.search(r"\{.*\}", text, re.S)
+        data = json.loads(m.group(0) if m else text)
+        headline = (data.get("headline") or "").strip() if AI_SIMPLE_HEADLINES else ""
+        take = (data.get("take") or "").strip() if want_take else ""
+        return headline or title, take
+    except Exception as e:
+        print("AI failed:", e)
+        return title, ""
 
 
-def send(text, silent=False):
+def send(text, silent=False, reply_to=None):
+    """Posts to Telegram. Returns the message id if it worked, else None."""
     if not BOT_TOKEN or not CHAT_ID:
         print("[dry run]", text.replace("\n", " | "))
-        return True
+        return 1
+    payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML",
+               "disable_web_page_preview": True, "disable_notification": silent}
+    if reply_to:
+        payload["reply_to_message_id"] = reply_to
     for _ in range(3):
-        r = requests.post(
-            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-            json={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML",
-                  "disable_web_page_preview": True,
-                  "disable_notification": silent},
-            timeout=20,
-        )
+        r = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                          json=payload, timeout=20)
         if r.status_code == 429:  # Telegram rate limit, wait and retry
             time.sleep(r.json().get("parameters", {}).get("retry_after", 5) + 1)
             continue
         if not r.ok:
             print("Telegram error:", r.text)
-        return r.ok
-    return False
+            return None
+        return r.json()["result"]["message_id"]
+    return None
 
 
 def esc(s):
     return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-def format_post(item):
-    headline = ai_rewrite(item["title"]).upper()
+def format_post(item, headline):
     prefix = "🚨 " if item["hot"] else ""
     flag = flag_for(item["title"])
     icon = f"{flag} " if flag else f"{item['emoji']} "
     return (
-        f"{prefix}{icon}<b>*{esc(headline)}</b>\n"
+        f"{prefix}{icon}<b>*{esc(headline.upper())}</b>\n"
         f"<i>— {esc(item['source'])}</i> · <a href=\"{esc(item['link'])}\">read</a>"
     )
 
@@ -302,9 +329,15 @@ def main():
             break
         if is_duplicate(it["title"], state["recent_titles"]):
             continue
-        if send(format_post(it), silent=not (it["hot"] or not LOUD_ONLY_FOR_WATCHLIST)):
+        want_take = AI_TAKES == "all" or (AI_TAKES == "hot" and it["hot"])
+        headline, take = ai_process(it["title"], it["source"], want_take)
+        msg_id = send(format_post(it, headline), silent=not (it["hot"] or not LOUD_ONLY_FOR_WATCHLIST))
+        if msg_id:
             state["recent_titles"].append(sorted(words(it["title"])))
             posted += 1
+            if take:
+                send(f"🧠 <b>Why it matters:</b> {esc(take)}\n<i>AI take, not financial advice</i>",
+                     silent=True, reply_to=msg_id)
             time.sleep(1.5)
 
     price_pulse(state)
