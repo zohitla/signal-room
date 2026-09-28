@@ -38,6 +38,7 @@ LOUD_ONLY_FOR_WATCHLIST = True
 AI_SIMPLE_HEADLINES = True   # rewrite every headline short + simple
 AI_TAKES = "hot"             # "hot" = 🧠 take under 🚨 stories only, "all" = every story, "off" = none
 AI_MODEL = "claude-haiku-4-5-20251001"
+MAX_LINE_CHARS = 20          # greentext: every line this short, so it fits an iPhone notification
 STYLE = "greentext"          # "greentext" = TAG – move + >why >implication, "wire" = *ALL CAPS style
 AI_FILTER = True             # AI skips junk (sports, local stories, fund promos...) before posting
 MAX_AI_CALLS_PER_RUN = 40    # cost safety cap
@@ -203,17 +204,18 @@ lines: {style_rule}
 
 take: {take_rule}"""
 
-GREENTEXT_RULE = """exactly 3 strings:
-1) "TAG – main move": TAG is the market, ticker, coin or country in CAPS (e.g. BTC, OIL, NVDA,
-   KOREA, JPY, FED, US STOCKS); main move is 2-5 lowercase words
-2) why it matters, lowercase, short (do NOT start with >, it gets added)
-3) short implication, lowercase, short (do NOT start with >)
-style: blunt, no corporate/newsroom language, no emojis, finance/internet slang ok ("cooked",
-"getting smoked", "printing", "bros") but never so much the info gets lost. slightly funny/dry but
-financially literate. keep the important numbers, companies, tickers, percentages, countries.
-rewrite, don't copy the headline. never invent facts or predict prices.
+GREENTEXT_RULE = """exactly 3 strings. HARD LIMIT: every string is 20 characters or less,
+count them. cut words, use symbols (+, /, -, %, $) and abbreviations to fit.
+1) "TAG – move": TAG = market, ticker, coin or country in CAPS (BTC, OIL, NVDA, KOREA, JPY, FED),
+   move = 1-3 lowercase words
+2) why it matters, lowercase (do NOT start with >, it gets added)
+3) short implication, lowercase (do NOT start with >)
+style: blunt, no newsroom language, no emojis, slang ok ("cooked", "smoked", "printing", "bros")
+but keep the key number/ticker/country. never invent facts or predict prices.
 example for "Seoul stocks fall 2% as Samsung, SK Hynix slide on rising yields":
-["KOREA – tech getting smoked", "kospi -2%", "samsung + sk hynix hit by yields"]"""
+["KOREA – tech smoked", "kospi -2%", "samsung/hynix hit"]
+example for "Oil jumps 4% after Iran rejects Hormuz deal":
+["OIL – +4%", "iran said no to deal", "hormuz still shut"]"""
 
 WIRE_RULE = """one line: the headline in the simplest possible words, max 12 words, keep key facts
 and numbers, no hype, no invented details."""
@@ -221,6 +223,16 @@ and numbers, no hype, no invented details."""
 TAKE_RULE = ("1-2 short lines on which sectors, stocks (tickers) or coins this could move and why. "
              "{voice} If it's not market-relevant, return an empty string. "
              "Never predict prices or tell anyone to buy or sell.")
+
+
+def shorten(line, limit=None):
+    """Trim to the char limit at a word boundary (safety net if the AI runs long)."""
+    limit = limit or MAX_LINE_CHARS
+    line = line.strip()
+    if len(line) <= limit:
+        return line
+    cut = line[:limit + 1].rsplit(" ", 1)[0].rstrip(" ,.-–:")
+    return cut if len(cut) >= limit // 2 else line[:limit].rstrip()
 
 
 def fallback_lines(title):
@@ -299,6 +311,8 @@ def esc(s):
 def format_post(item, lines):
     link = f"<a href=\"{esc(item['link'])}\">read</a>"
     if STYLE == "greentext":
+        if len(lines) > 1:  # AI-written greentext: enforce the limit. plain fallback headline stays whole
+            lines = [shorten(l) for l in lines]
         head, rest = lines[0], lines[1:3]
         alert = "🚨 " if item["hot"] else ""
         body = alert + esc(head)
