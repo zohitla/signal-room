@@ -38,6 +38,7 @@ LOUD_ONLY_FOR_WATCHLIST = True
 AI_SIMPLE_HEADLINES = True   # rewrite every headline short + simple
 AI_TAKES = "hot"             # "hot" = 🧠 take under 🚨 stories only, "all" = every story, "off" = none
 AI_MODEL = "claude-haiku-4-5-20251001"
+STYLE = "greentext"          # "greentext" = TAG – move + >why >implication, "wire" = *ALL CAPS style
 AI_FILTER = True             # AI skips junk (sports, local stories, fund promos...) before posting
 MAX_AI_CALLS_PER_RUN = 40    # cost safety cap
 
@@ -190,30 +191,52 @@ Headline: {title}
 Source: {source}
 
 Reply with ONLY a JSON object, no other text:
-{{"keep": true, "headline": "...", "take": "..."}}
+{{"keep": true, "lines": ["...", "..."], "take": "..."}}
 
 keep: true ONLY if a trader or someone following world news would care: markets, stocks,
 crypto, oil/commodities, central banks, economy data, big tech/AI, wars, geopolitics,
 elections, sanctions/tariffs, or disasters with global impact. false for sports, local or
 regional stories with no market impact, lifestyle, celebrity, fund/product promos,
 routine company reports nobody trades on, listicles and how-tos.
-headline: rewrite it in the simplest possible words, max 12 words, keep the key facts
-and numbers, no hype, no invented details.
+
+lines: {style_rule}
+
 take: {take_rule}"""
 
+GREENTEXT_RULE = """exactly 3 strings:
+1) "TAG – main move": TAG is the market, ticker, coin or country in CAPS (e.g. BTC, OIL, NVDA,
+   KOREA, JPY, FED, US STOCKS); main move is 2-5 lowercase words
+2) why it matters, lowercase, short (do NOT start with >, it gets added)
+3) short implication, lowercase, short (do NOT start with >)
+style: blunt, no corporate/newsroom language, no emojis, finance/internet slang ok ("cooked",
+"getting smoked", "printing", "bros") but never so much the info gets lost. slightly funny/dry but
+financially literate. keep the important numbers, companies, tickers, percentages, countries.
+rewrite, don't copy the headline. never invent facts or predict prices.
+example for "Seoul stocks fall 2% as Samsung, SK Hynix slide on rising yields":
+["KOREA – tech getting smoked", "kospi -2%", "samsung + sk hynix hit by yields"]"""
+
+WIRE_RULE = """one line: the headline in the simplest possible words, max 12 words, keep key facts
+and numbers, no hype, no invented details."""
+
 TAKE_RULE = ("1-2 short lines on which sectors, stocks (tickers) or coins this could move and why. "
-             "Plain language. If it's not market-relevant, return an empty string. "
+             "{voice} If it's not market-relevant, return an empty string. "
              "Never predict prices or tell anyone to buy or sell.")
 
 
+def fallback_lines(title):
+    return [title.lower()] if STYLE == "greentext" else [title]  # no AI: plain headline
+
+
 def ai_process(title, source, want_take):
-    """Returns (keep, headline, take). Falls back to the original title if AI is off or fails."""
+    """Returns (keep, lines, take). Falls back to the original title if AI is off or fails."""
     if not ANTHROPIC_KEY or not (AI_SIMPLE_HEADLINES or want_take or AI_FILTER):
-        return True, title, ""
+        return True, fallback_lines(title), ""
     try:
+        voice = ("Same lowercase blunt greentext voice." if STYLE == "greentext" else "Plain language.")
         prompt = AI_PROMPT.format(
             title=title, source=source,
-            take_rule=TAKE_RULE if want_take else 'always return an empty string ""',
+            style_rule=GREENTEXT_RULE if STYLE == "greentext" else WIRE_RULE,
+            take_rule=TAKE_RULE.format(voice=voice) if want_take else 'always return an empty string ""',
         )
         r = requests.post(
             "https://api.anthropic.com/v1/messages",
@@ -222,24 +245,29 @@ def ai_process(title, source, want_take):
                 "anthropic-version": "2023-06-01",
                 "content-type": "application/json",
             },
-            json={"model": AI_MODEL, "max_tokens": 250,
+            json={"model": AI_MODEL, "max_tokens": 300,
                   "messages": [{"role": "user", "content": prompt}]},
             timeout=30,
         )
         if not r.ok:
             print("AI error:", r.status_code, r.text[:200])
-            return True, title, ""
+            return True, fallback_lines(title), ""
         text = r.json()["content"][0]["text"].strip()
         text = re.sub(r"^```(json)?|```$", "", text).strip()
         m = re.search(r"\{.*\}", text, re.S)
         data = json.loads(m.group(0) if m else text)
-        headline = (data.get("headline") or "").strip() if AI_SIMPLE_HEADLINES else ""
+        lines = data.get("lines") or []
+        if isinstance(lines, str):
+            lines = [lines]
+        lines = [str(l).lstrip(">").strip() for l in lines if str(l).strip()][:3]
+        if not AI_SIMPLE_HEADLINES or not lines:
+            lines = fallback_lines(title)
         take = (data.get("take") or "").strip() if want_take else ""
         keep = bool(data.get("keep", True)) if AI_FILTER else True
-        return keep, headline or title, take
+        return keep, lines, take
     except Exception as e:
         print("AI failed:", e)
-        return True, title, ""
+        return True, fallback_lines(title), ""
 
 
 def send(text, silent=False, reply_to=None):
@@ -268,14 +296,31 @@ def esc(s):
     return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-def format_post(item, headline):
+def format_post(item, lines):
+    link = f"<a href=\"{esc(item['link'])}\">read</a>"
+    if STYLE == "greentext":
+        head, rest = lines[0], lines[1:3]
+        alert = "🚨 " if item["hot"] else ""
+        body = alert + esc(head)
+        if rest:
+            body += "\n" + "\n".join("&gt;" + esc(l) for l in rest)
+        src = esc(item["source"].lower())
+        return f"<pre>{body}</pre><a href=\"{esc(item['link'])}\">{src}</a>"
+    headline = " ".join(lines)
     prefix = "🚨 " if item["hot"] else ""
     flag = flag_for(item["title"])
     icon = f"{flag} " if flag else f"{item['emoji']} "
     return (
         f"{prefix}{icon}<b>*{esc(headline.upper())}</b>\n"
-        f"<i>— {esc(item['source'])}</i> · <a href=\"{esc(item['link'])}\">read</a>"
+        f"<i>— {esc(item['source'])}</i> · {link}"
     )
+
+
+def format_take(take):
+    if STYLE == "greentext":
+        lines = [l.strip().lstrip(">").strip() for l in re.split(r"\n|(?<=[.;])\s+", take) if l.strip()]
+        return "<pre>" + "\n".join("&gt;" + esc(l) for l in lines[:3]) + "</pre><i>ai take, nfa</i>"
+    return f"🧠 <b>Why it matters:</b> {esc(take)}\n<i>AI take, not financial advice</i>"
 
 
 def price_pulse(state):
@@ -360,24 +405,24 @@ def main():
         if blocked(it["title"]):
             skipped += 1
             continue
-        want_take = AI_TAKES == "all" or (AI_TAKES == "hot" and it["hot"])
+        # greentext has the implication built in, so no separate reply needed
+        want_take = STYLE != "greentext" and (AI_TAKES == "all" or (AI_TAKES == "hot" and it["hot"]))
         if ai_calls < MAX_AI_CALLS_PER_RUN:
             ai_calls += 1
-            keep, headline, take = ai_process(it["title"], it["source"], want_take)
+            keep, lines, take = ai_process(it["title"], it["source"], want_take)
         else:
-            keep, headline, take = True, it["title"], ""
+            keep, lines, take = True, fallback_lines(it["title"]), ""
         if not keep:
             skipped += 1
             state["recent_titles"].append(sorted(words(it["title"])))  # remember junk, don't re-check copies
             print("Skipped (junk):", it["title"])
             continue
-        msg_id = send(format_post(it, headline), silent=not (it["hot"] or not LOUD_ONLY_FOR_WATCHLIST))
+        msg_id = send(format_post(it, lines), silent=not (it["hot"] or not LOUD_ONLY_FOR_WATCHLIST))
         if msg_id:
             state["recent_titles"].append(sorted(words(it["title"])))
             posted += 1
             if take:
-                send(f"🧠 <b>Why it matters:</b> {esc(take)}\n<i>AI take, not financial advice</i>",
-                     silent=True, reply_to=msg_id)
+                send(format_take(take), silent=True, reply_to=msg_id)
             time.sleep(1.5)
 
     price_pulse(state)
