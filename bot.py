@@ -12,6 +12,7 @@ Runs once per call (GitHub Actions calls it on a schedule).
 import json
 import os
 import re
+import socket
 import time
 from datetime import datetime, timezone
 from urllib.parse import quote_plus, unquote_plus
@@ -27,7 +28,8 @@ ANTHROPIC_KEY = os.environ.get("ANTHROPIC_API_KEY", "")   # optional: AI-rewritt
 
 MAX_POSTS_PER_RUN = 15      # stops spam if lots of news drops at once
 MAX_AGE_HOURS = 3           # ignore anything older than this
-SIMILARITY_CUTOFF = 0.5     # 0-1, how similar two headlines must be to count as duplicates
+SIMILARITY_CUTOFF = 0.6     # merged without the AI only if one headline contains all the other's words
+                            # (just extra words added). any swapped word -> the AI decides
 PRICE_PULSE_EVERY_HOURS = 4 # posts BTC/ETH/SOL prices every X hours (0 = off)
 
 # Phone pings: True = only 🚨 watchlist headlines buzz your phone, everything else
@@ -52,7 +54,15 @@ BLOCKLIST = [
 ]
 
 # ───────── ALERTS ─────────
-MIN_SCORE = 4                # AI importance below this doesn't get posted (kills filler)
+MIN_SCORE = 5                # AI importance below this doesn't get posted (kills filler)
+BUZZ_MIN_SCORE = 7           # only stories this important buzz your phone (the rest arrive silently)
+MAX_BUZZ_PER_HOUR = 4        # hard cap on phone buzzes per hour: news + ALL alerts incl. price alerts
+TOPIC_COOLDOWN_HOURS = 6     # follow-ups on a story posted within this that are smaller updates arrive without buzzing
+RUN_TIME_LIMIT_SECONDS = 240 # stop starting new work after this, so the run always finishes and saves
+                             # (GitHub kills the job at 10 min). leftovers wait in the queue.
+RUN_STARTED = time.time()
+socket.setdefaulttimeout(15)  # no single feed can hang the run
+RECENT_FOR_AI = 20           # how many recent posts the AI sees, so it can skip rehashed stories
 MAJOR_SCORE = 8              # AI importance 1-10. this or higher = 🚨🚨 MAJOR headline (always buzzes)
 
 # 🎯 Price alerts: (coin id on coingecko, "above" or "below", price in USD)
@@ -160,9 +170,12 @@ def check_health(state):
         else:
             rec["fails"] += 1
             if rec["fails"] >= HEALTH_WARN_AFTER and not rec["warned"]:
+                loud = can_buzz(state)  # warnings share the same 4/hour buzz cap
                 if send(f"⚠️ <b>{esc(part.upper())} NOT WORKING</b>\n"
-                        f"&gt;failed {rec['fails']} runs in a row\n&gt;{esc(result[:120])}"):
+                        f"&gt;failed {rec['fails']} runs in a row\n&gt;{esc(result[:120])}", silent=not loud):
                     rec["warned"] = True  # if even the warning can't send, try again next run
+                    if loud:
+                        used_buzz(state)
 
 
 def load_state():
@@ -201,6 +214,10 @@ CONTRAST = [
     {"open", "opens", "reopen", "reopens", "close", "closes", "shut", "shuts"},
     {"ceasefire", "truce", "attack", "attacks", "strike", "strikes"},
 ]
+NUMBER_WORDS = {"one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
+                "eleven", "twelve", "twenty", "thirty", "fifty", "hundred", "thousand", "million",
+                "billion", "trillion", "half", "quarter", "double", "doubles", "triple", "triples",
+                "first", "second", "third", "record"}
 NEGATIONS = {"not", "no", "never", "denies", "denied", "fails", "failed", "halts", "halted", "cancels", "canceled"}
 
 
@@ -212,9 +229,13 @@ def is_duplicate(title, recent_titles):
         o = set(old)
         if not o or len(w & o) / len(w | o) < SIMILARITY_CUTOFF:
             continue
+        # only a copy if one headline just ADDS words to the other ("..., report says").
+        # if any word was swapped (rejects -> revises/approves), let the AI decide instead
+        if not (w <= o or o <= w):
+            continue
         diff = w ^ o
         # different numbers = a new update (btc 90k vs 95k), not a copy
-        if any(re.search(r"\d", t) for t in diff):
+        if any(re.search(r"\d", t) for t in diff) or diff & NUMBER_WORDS:
             continue
         # opposite outcomes (accepts vs rejects, up vs down) = new story
         if any(len(diff & group) > 0 and len(w & group) > 0 and len(o & group) > 0 and (w & group) != (o & group)
@@ -275,8 +296,23 @@ AI_PROMPT = """You write for a fast Telegram news feed read by crypto/stock trad
 Headline: {title}
 Source: {source}
 
+ALREADY POSTED recently (don't repeat these):
+{recent}
+
 Reply with ONLY a JSON object, no other text:
-{{"keep": true, "score": 5, "lines": ["...", "..."], "take": "..."}}
+{{"keep": true, "new": true, "score": 5, "topic": "...", "tickers": ["..."], "lines": ["...", "..."], "take": "..."}}
+
+new: false if this is the same story as something ALREADY POSTED, or just a rehash / follow-up
+opinion piece with no new facts. true only if it adds a real new development (new number,
+new decision, reversal, escalation, new company involved).
+
+topic: 2-5 lowercase words naming the underlying story, the same way every time for the same
+story (e.g. "meta muse ai agents", "iran hormuz deal", "fed rate decision").
+
+tickers: up to 4 tickers or coins DIRECTLY connected to this story: the companies/coins named in
+the headline, or ones whose own business is the direct subject (e.g. an oil price move -> XOM,
+CVX; a Binance hack -> BNB). do NOT add companies that might indirectly benefit or that are just
+in the same industry. if you're not sure a ticker belongs, leave it out. empty list if none.
 
 keep: true ONLY if a trader or someone following world news would care: markets, stocks,
 crypto, oil/commodities, central banks, economy data, big tech/AI, wars, geopolitics,
@@ -304,8 +340,8 @@ every post.
    move = 1-3 lowercase words
 2) why it matters, lowercase (do NOT start with >, it gets added)
 3) short implication, lowercase (do NOT start with >)
-write it so a 16 year old new investor instantly gets it: simple everyday words, no jargon
-(say "rates going up" not "hawkish repricing"), but keep it accurate.
+reading level: grade 8 to 10. clear everyday words a high schooler knows, short sentences,
+no finance jargon (say "rates going up" not "hawkish repricing"), but keep it accurate.
 style: blunt, no newsroom language, no emojis, slang ok ("cooked", "smoked", "printing", "bros")
 but keep the key number/ticker/country. never invent facts or predict prices.
 example for "Seoul stocks fall 2% as Samsung, SK Hynix slide on rising yields":
@@ -335,14 +371,20 @@ def fallback_lines(title):
     return [title.lower()] if STYLE == "greentext" else [title]  # no AI: plain headline
 
 
-def ai_process(title, source, want_take):
-    """Returns (keep, lines, take, score). Falls back to the original title if AI is off or fails."""
+def ai_fallback(title):
+    return {"keep": True, "new": True, "score": 0, "topic": "", "tickers": [],
+            "lines": fallback_lines(title), "take": ""}
+
+
+def ai_process(title, source, want_take, recent=None):
+    """Returns a dict: keep, new, score, topic, tickers, lines, take. Falls back to the plain headline."""
     if not ANTHROPIC_KEY or not (AI_SIMPLE_HEADLINES or want_take or AI_FILTER):
-        return True, fallback_lines(title), "", 0
+        return ai_fallback(title)
     try:
         voice = ("Same lowercase blunt greentext voice." if STYLE == "greentext" else "Plain language.")
+        recent_txt = "\n".join(f"- {r}" for r in (recent or [])[-RECENT_FOR_AI:]) or "- (nothing yet)"
         prompt = AI_PROMPT.format(
-            title=title, source=source,
+            title=title, source=source, recent=recent_txt,
             style_rule=GREENTEXT_RULE if STYLE == "greentext" else WIRE_RULE,
             take_rule=TAKE_RULE.format(voice=voice) if want_take else 'always return an empty string ""',
         )
@@ -353,15 +395,15 @@ def ai_process(title, source, want_take):
                 "anthropic-version": "2023-06-01",
                 "content-type": "application/json",
             },
-            json={"model": AI_MODEL, "max_tokens": 300,
+            json={"model": AI_MODEL, "max_tokens": 400,
                   "messages": [{"role": "user", "content": prompt}]},
-            timeout=30,
+            timeout=15,
         )
         if not r.ok:
             print("AI error:", r.status_code, r.text[:200])
             why = "out of credits, posting plain headlines" if "credit" in r.text.lower() else f"error {r.status_code}"
             mark("ai", False, why)
-            return True, fallback_lines(title), "", 0
+            return ai_fallback(title)
         text = r.json()["content"][0]["text"].strip()
         text = re.sub(r"^```(json)?|```$", "", text).strip()
         m = re.search(r"\{.*\}", text, re.S)
@@ -373,17 +415,26 @@ def ai_process(title, source, want_take):
         lines = [str(l).lstrip(">").strip() for l in lines if str(l).strip()][:3]
         if not AI_SIMPLE_HEADLINES or not lines:
             lines = fallback_lines(title)
-        take = (data.get("take") or "").strip() if want_take else ""
-        keep = bool(data.get("keep", True)) if AI_FILTER else True
         try:
             score = int(data.get("score", 0))
         except (TypeError, ValueError):
             score = 0
-        return keep, lines, take, score
+        tickers = [re.sub(r"[^A-Z0-9.]", "", str(t).upper().lstrip("$"))
+                   for t in (data.get("tickers") or []) if str(t).strip()]
+        tickers = [t for t in tickers if 1 <= len(t) <= 6][:4]
+        return {
+            "keep": (bool(data.get("keep", True)) and bool(data.get("new", True))) if AI_FILTER else True,
+            "new": bool(data.get("new", True)),
+            "score": score,
+            "topic": str(data.get("topic") or "").lower().strip()[:60],
+            "tickers": tickers,
+            "lines": lines,
+            "take": (data.get("take") or "").strip() if want_take else "",
+        }
     except Exception as e:
         print("AI failed:", e)
         mark("ai", False, f"bad response: {str(e)[:80]}")
-        return True, fallback_lines(title), "", 0
+        return ai_fallback(title)
 
 
 TELEGRAM_DOWN = False   # set when Telegram can't be reached, so the run stops hammering it
@@ -443,14 +494,26 @@ def format_post(item, lines):
         if len(lines) > 1:  # AI-written: only trim runaway lines, never normal ones
             lines = [shorten(l, MAX_LINE_CHARS + 20) for l in lines]
         head, rest = lines[0], lines[1:3]
-        alert = "🚨🚨 MAJOR: " if item.get("major") else ("🚨 " if item["hot"] else "")
+        if item.get("major") and item.get("buzz"):
+            alert = "🚨🚨 MAJOR: "
+        elif item.get("major"):
+            alert = "MAJOR: "  # big, but the hourly buzz budget was used up, so no sirens
+        elif item.get("buzz"):
+            alert = "🚨 "
+        else:
+            alert = ""
         body = f"<b>{alert}{esc(head.upper())}</b>"
         if rest:
             body += "\n" + "\n".join("&gt;" + esc(l) for l in rest)
+        if item.get("tickers"):
+            body += "\n&gt;watch: " + " ".join("$" + esc(t) for t in item["tickers"])
         src = esc(item["source"].lower())
         return f"{body}\n<a href=\"{esc(item['link'])}\">{src}</a>"
     headline = " ".join(lines)
-    prefix = "🚨🚨 MAJOR: " if item.get("major") else ("🚨 " if item["hot"] else "")
+    if item.get("major"):
+        prefix = "🚨🚨 MAJOR: " if item.get("buzz") else "MAJOR: "
+    else:
+        prefix = "🚨 " if item.get("buzz") else ""
     flag = flag_for(item["title"])
     icon = f"{flag} " if flag else f"{item['emoji']} "
     return (
@@ -555,12 +618,27 @@ def sent_ok(state, key):
     state["alerts"]["cooldown"][key] = time.time()
 
 
+def can_buzz(state):
+    """Shared phone-buzz budget for news + alerts: max MAX_BUZZ_PER_HOUR per rolling hour."""
+    now = time.time()
+    times = [t for t in state.get("buzz_times", []) if now - t < 3600]
+    state["buzz_times"] = times
+    return len(times) < MAX_BUZZ_PER_HOUR
+
+
+def used_buzz(state):
+    state.setdefault("buzz_times", []).append(time.time())
+
+
 def alert(state, key, text):
     """Send an alert if off cooldown; start the cooldown only if it really went out."""
     if not cooled(state, key):
         return 0
-    if send(text):
+    loud = can_buzz(state)
+    if send(text, silent=not loud):
         sent_ok(state, key)
+        if loud:
+            used_buzz(state)
         return 1
     mark("telegram posting", False, "alert failed to send")
     return 0
@@ -678,7 +756,10 @@ def run_alerts(state):
             if hit and a["armed"].get(key, True):
                 sym = c.get("symbol", cid)
                 lines = [f"now {money(price)}", f"24h {pct(c.get('price_change_percentage_24h') or 0)}"]
-                if send(alert_msg("🎯", sym, f"{side} {money(level)}", lines, cid)):
+                loud = can_buzz(state)  # same 4/hour cap as everything else
+                if send(alert_msg("🎯", sym, f"{side} {money(level)}", lines, cid), silent=not loud):
+                    if loud:
+                        used_buzz(state)
                     a["armed"][key] = False  # only disarm once it's actually delivered
                     sent += 1
             elif not hit:
@@ -764,11 +845,18 @@ def run(state):
     seen = set(state["seen"])
     new_items = []
 
+    done_keys = set()
+
     def done(key):
         """Only mark a story seen once we've actually handled it (posted, or decided to skip)."""
-        state["seen"].append(key)
+        if key not in done_keys:
+            done_keys.add(key)
+            state["seen"].append(key)
 
     for category, emoji, url in FEEDS:
+        if time.time() - RUN_STARTED > RUN_TIME_LIMIT_SECONDS * 0.3:
+            print("Feed time budget used, skipping remaining feeds this run")
+            break
         name = url.split("/")[2].replace("www.", "")
         is_search = "news.google.com" in url
         if is_search:
@@ -845,8 +933,26 @@ def run(state):
 
     posted = skipped = ai_calls = 0
     finished = set()
+
+    # Pass 1: run the AI on new stories first, so we can post (and buzz) the biggest ones first
+    recent_posts = [r[0] for r in state.get("recent_posts", [])]
     for it in queue:
-        if posted >= MAX_POSTS_PER_RUN or TELEGRAM_DOWN:
+        if "lines" in it or ai_calls >= MAX_AI_CALLS_PER_RUN:
+            continue
+        if time.time() - RUN_STARTED > RUN_TIME_LIMIT_SECONDS * 0.6:
+            print("AI time budget used, remaining stories get the AI next run")
+            break
+        if blocked(it["title"]) or is_duplicate(it["title"], state["recent_titles"]):
+            continue  # handled cheaply in pass 2, no AI needed
+        want_take = STYLE != "greentext" and (AI_TAKES == "all" or (AI_TAKES == "hot" and it["hot"]))
+        ai_calls += 1
+        res = ai_process(it["title"], it["source"], want_take, recent_posts)
+        it.update(res)  # MIN_SCORE is applied after the story-tracking check below
+    queue.sort(key=lambda x: (-x.get("score", 0), not x["hot"], x.get("queued_at", 0)))
+
+    # Pass 2: filter and post, most important first
+    for it in queue:
+        if posted >= MAX_POSTS_PER_RUN or TELEGRAM_DOWN or time.time() - RUN_STARTED > RUN_TIME_LIMIT_SECONDS:
             break  # rest stays in the queue for next run
         key = it["key"]
         if is_duplicate(it["title"], state["recent_titles"]):
@@ -856,22 +962,15 @@ def run(state):
             skipped += 1
             finished.add(key)
             continue
-        # AI result is saved on the item, so a retry doesn't pay for the AI again
         if "lines" not in it:
-            want_take = STYLE != "greentext" and (AI_TAKES == "all" or (AI_TAKES == "hot" and it["hot"]))
-            if ai_calls < MAX_AI_CALLS_PER_RUN:
-                ai_calls += 1
-                keep, lines, take, score = ai_process(it["title"], it["source"], want_take)
-            else:
-                keep, lines, take, score = True, fallback_lines(it["title"]), "", 0
-            if ANTHROPIC_KEY and 0 < score < MIN_SCORE:
-                keep = False
-            it.update(keep=keep, lines=lines, take=take, score=score)
+            if ANTHROPIC_KEY and not blocked(it["title"]) and not is_duplicate(it["title"], state["recent_titles"]):
+                continue  # AI didn't get to it this run: keep it queued for next run's AI pass
+            it.update(ai_fallback(it["title"]))
         it["major"] = it["score"] >= MAJOR_SCORE
         if not it["keep"]:
             skipped += 1
             finished.add(key)
-            print("Skipped (junk):", it["title"])
+            print("Skipped (junk or rehash):", it["title"])
             continue
         lines = it["lines"]
         rewritten = " ".join(lines)
@@ -881,13 +980,59 @@ def run(state):
             state["recent_titles"].append(sorted(words(it["title"])))
             print("Skipped (same story):", it["title"])
             continue
-        loud = it["major"] or it["hot"] or not LOUD_ONLY_FOR_WATCHLIST
+        # same specific story posted recently? only let it through if it's a real new development.
+        # needs 3+ topic words so broad topics like "oil" or "meta" never block anything.
+        topic_w = words(it.get("topic", ""))
+        now_t = time.time()
+        recent_topics = [t for t in state.get("recent_topics", []) if now_t - t[1] < TOPIC_COOLDOWN_HOURS * 3600]
+        state["recent_topics"] = recent_topics
+        if len(topic_w) >= 3:
+            for tw, ts, tscore in recent_topics:
+                tw = set(tw)
+                if len(topic_w & tw) / len(topic_w | tw) < 0.75:
+                    continue
+                # AI says it's a new development -> it always posts. if it's less important than
+                # what we already posted on this story, it posts quietly (no buzz) instead of being dropped
+                it["tracked"] = True
+                if it["score"] < tscore:
+                    it["quiet"] = True
+                    print("Same story, smaller update, posting quietly:", it["title"])
+                else:
+                    print("Same story, new development, posting:", it["title"])
+                break
+        # filler filter: low-importance stories are skipped, EXCEPT new updates on a story we're tracking
+        if ANTHROPIC_KEY and 0 < it["score"] < MIN_SCORE and not it.get("tracked"):
+            skipped += 1
+            finished.add(key)
+            print("Skipped (low importance):", it["title"])
+            continue
+        if it.get("tracked") and it["score"] < MIN_SCORE:
+            it["quiet"] = True
+        # buzz only for big stories, within the hourly budget
+        if not LOUD_ONLY_FOR_WATCHLIST:
+            want_buzz = True
+        elif it["score"]:
+            want_buzz = it["score"] >= BUZZ_MIN_SCORE
+        else:
+            want_buzz = it["hot"]  # no AI score available: fall back to the watchlist
+        it["buzz"] = want_buzz and not it.get("quiet") and can_buzz(state)
+        loud = it["buzz"]
         msg_id = send(format_post(it, lines), silent=not loud)
         if msg_id:
             finished.add(key)
             state["recent_titles"].append(sorted(words(it["title"])))
             state.setdefault("recent_rewrites", []).append(sorted(words(rewritten)))
+            state.setdefault("recent_posts", []).append([rewritten, time.time()])
+            state["recent_posts"] = state["recent_posts"][-RECENT_FOR_AI:]
+            if len(topic_w) >= 2:
+                state.setdefault("recent_topics", []).append([sorted(topic_w), time.time(), it["score"]])
+            if loud:
+                used_buzz(state)
             posted += 1
+            finished.add(key)
+            done(key)
+            # checkpoint: if the run gets killed now, this story is saved as posted AND out of the queue
+            save_state({**state, "queue": [q for q in queue if q["key"] not in finished]})
             if it.get("take"):
                 send(format_take(it["take"]), silent=True, reply_to=msg_id)
             time.sleep(1.5)
@@ -900,8 +1045,11 @@ def run(state):
     queue[:] = [q for q in queue if q["key"] not in finished]
     waiting = len(queue)
 
-    run_alerts(state)
-    price_pulse(state)
+    if time.time() - RUN_STARTED < RUN_TIME_LIMIT_SECONDS:
+        run_alerts(state)
+        price_pulse(state)
+    else:
+        print("Out of time, market alerts run next time")
     check_health(state)
     state.pop("send_fails", None)
     save_state(state)
